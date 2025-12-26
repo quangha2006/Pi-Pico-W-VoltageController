@@ -2,8 +2,11 @@ from picozero import pico_led
 from time import sleep
 from machine import Pin, PWM
 from RotateEncoder import Rotary
-from ir_rx.nec import NEC_8
+from ir_rx.nec import MITSUBISHI
 from ir_rx.print_error import print_error
+import utime
+from sys import platform
+import sys, select, time
 #from neopixel import NeoPixel
 import gc
 
@@ -11,11 +14,13 @@ pico_led.on()
 
 digital_Min = 50
 digital_Max = 300
-digital_step = 10
+digital_step = 5
 increase_step = 1
 target_value = 100 #Start
 current_value = digital_Min
 duty_count = 32768
+button_step_timeoutMS = 100
+gc_collect_interval_seconds = 60.0
 
 led_remain_count = 0
 led_on_count = 3
@@ -33,7 +38,7 @@ Input_Led = Pin(8, Pin.OUT)
 Power_Led = Pin(9, Pin.OUT)
 
 ir_PIN = Pin(16, Pin.IN)
-rotary = Rotary(4,5,3)
+rotary = Rotary(4,5,3,2)
 Power_Led.high()
 #RGB Onboard Led
 #led_RGB_onboard = Pin(23, Pin.OUT)
@@ -46,41 +51,54 @@ def rotary_changed(change):
     global isOff
     global led_remain_count
     global isOffRotate
+    global button_timeout
+    if button_timeout > 0:
+        print(f"Ignore ButtonPreesed button_timeout = {button_timeout}")
+        return
+    led_remain_count = led_on_count
     if change == Rotary.ROT_CW:
         target_value += digital_step
-        led_remain_count = led_on_count
+        if isOff:
+            isOff = False
+        print(f"CW => {target_value}")
     elif change == Rotary.ROT_CCW:
         target_value -= digital_step
-        led_remain_count = led_on_count
+        if isOff:
+            isOff = False
+        print(f"CCW => {target_value}")
     elif change == Rotary.SW_PRESS:
         print('PRESS')
-        #isOff = not isOff
         isOffRotate = not isOffRotate
-        led_remain_count = led_on_count
     elif change == Rotary.SW_RELEASE:
         print('RELEASE')
+    button_timeout = button_step_timeoutMS
         
 def ir_cb(data, addr, ctrl):
     global target_value
     global isOff
     global led_remain_count
-    if data < 0:  # NEC protocol sends repeat codes.
-        print("Repeat code.")
-    else:
-        if data == 25:
-            target_value += digital_step
-            led_remain_count = led_on_count
-            print("Button A pressed")
-        elif data == 24:
-            target_value -= digital_step
-            led_remain_count = led_on_count
-            print("Button B pressed")
-        elif data == 64:
-            print("Button Power pressed")
-            led_remain_count = led_on_count
-            isOff = not isOff
-        else:
-            print(f"Data 0x{data:02x} Addr 0x{addr:04x} Ctrl 0x{ctrl:02x}")
+    global isOffRotate
+    #print("addr", hex(addr), "cmd", hex(data), "bytes", [hex(x) for x in ctrl])
+    button_id = ctrl[6] if ctrl and len(ctrl) > 6 else None
+    #print("button id:", hex(button_id) if button_id else None)
+    button_map = {0x01: "Power", 0x02: "Increase", 0x05: "Decrease", 0x04: "Swing_ON", 0x03: "Swing_OFF"}
+    label = button_map.get(ctrl[6], f"unk_{hex(ctrl[6])}")
+    print("button label:", label)
+    led_remain_count = led_on_count
+    if label == "Increase":
+        target_value += digital_step
+        if isOff:
+            isOff = False
+    elif label == "Decrease":
+        target_value -= digital_step
+        if isOff:
+            isOff = False
+    elif label == "Swing_ON":
+        isOffRotate = False
+    elif label == "Swing_OFF":
+        isOffRotate = True
+    elif label == "Power":
+        isOff = not isOff
 
 def save_to_csv(filename, data):
     try:
@@ -95,7 +113,7 @@ def read_csv(filename):
         data = []
         with open(filename, "r") as file:
             for line in file:
-                data.append(line.strip())  # Loại bỏ ký tự xuống dòng
+                data.append(line.strip())
 
         return data
     except Exception as ex:
@@ -105,7 +123,7 @@ def split_csv_line(line):
     return [value.strip() for value in line.split(',')]
 
 rotary.add_handler(rotary_changed)
-ir = NEC_8(ir_PIN, ir_cb)
+ir = MITSUBISHI(ir_PIN, ir_cb)
 ir.error_function(print_error)
 
 try:
@@ -116,10 +134,13 @@ try:
     lastIsOff = True
     isOffRotate = True
     lastIsOffRotate = True
-    total_Time = 0.0
+    total_Time_seconds = 0.0
+    button_timeout = 0
     SS_Relay.low()
     RT_Relay.high()
-    
+    last = utime.ticks_ms()
+    now = utime.ticks_ms()
+    dt_ms = 0
     Input_Led.low()
     #Read Data:
     csv_data = read_csv(data_fileName)
@@ -138,7 +159,12 @@ try:
         print("Failed to read data from CSV file.")
 
     while (True):
-        total_Time += 0.033
+        now = utime.ticks_ms()
+        dt_ms = utime.ticks_diff(now, last)
+        last = now
+        total_Time_seconds += dt_ms/ 1000.0
+        if button_timeout >= 0:
+            button_timeout -= dt_ms
         if led_on:
             pico_led.on()
             led_on = False
@@ -163,7 +189,7 @@ try:
                 else:
                     current_value -= increase_step
 
-            print(current_value)
+            print(f'FanSpeed = {current_value}')
             pwm0.freq(current_value)
             #pwm0.duty_u16(current_value)      # set duty cycle, range 0-65535
 
@@ -171,13 +197,13 @@ try:
             if isOff:
                 pwm0.duty_u16(0)
                 SS_Relay.high()
-                print("Off Fan")
+                print("Off Fan by IR")
             else:
                 SS_Relay.low()
                 current_value = digital_Min
                 pwm0.freq(current_value)
                 pwm0.duty_u16(duty_count)
-                print("On Fan")
+                print("On Fan by IR")
             lastIsOff = isOff
         
         if lastIsOffRotate != isOffRotate:
@@ -195,9 +221,9 @@ try:
         else:
             Input_Led.low()
 
-        if total_Time > 5.0:
+        if total_Time_seconds > gc_collect_interval_seconds:
             gc.collect()
-            total_Time = 0.0
+            total_Time_seconds = 0.0
 
         if lastSaveValue != target_value:
             lastSaveValue = target_value
@@ -205,11 +231,6 @@ try:
             save_to_csv(data_fileName, data_to_save)
 
         sleep(0.033)
-        if Break_Pin.value() == 0:
-            break
         
 except KeyboardInterrupt:
     ir.close()
-    machine.reset()
-
-

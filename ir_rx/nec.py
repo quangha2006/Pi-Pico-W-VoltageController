@@ -67,3 +67,56 @@ class NEC_16(NEC_ABC):
 class SAMSUNG(NEC_ABC):
     def __init__(self, pin, callback, *args):
         super().__init__(pin, True, True, callback, *args)
+
+class MITSUBISHI(IR_RX):
+    """Decoder for Mitsubishi/Some AC remotes that use a ~3.2ms leader
+    and 0/1 encoding where marks are ~470us and a space > ~900us means '1'.
+    This class is conservative: it checks leader length and ignores short bursts.
+    """
+    def __init__(self, pin, callback, *args):
+        # Allow more edges (some remotes send long frames) and a 120ms block timer
+        # Increased nedges to accommodate longer frames without overrun
+        super().__init__(pin, 140, 120, callback, *args)
+
+    def decode(self, _):
+        vals = []
+        try:
+            # Protect against too many edges
+            if self.edge > self._nedges:
+                raise RuntimeError(self.OVERRUN)
+            if self.edge < 3:
+                raise RuntimeError(self.BADBLOCK)
+            leader = ticks_diff(self._times[1], self._times[0])
+            # Expect leader mark ~3200us (+/- ~800us)
+            if not (2800 < leader < 3600):
+                raise RuntimeError(self.BADSTART)
+
+            # Parse bit pairs: mark (short) then space: space > 900 -> 1 else 0
+            bits = []
+            for edge in range(3, self.edge - 1, 2):
+                space = ticks_diff(self._times[edge + 1], self._times[edge])
+                bits.append(1 if space > 900 else 0)
+
+            nbits = len(bits)
+            if nbits < 32:
+                # Too short to be a valid frame
+                raise RuntimeError(self.BADDATA)
+
+            # Build byte list (LSB first per byte)
+            nbytes = nbits // 8
+            for b in range(nbytes):
+                v = 0
+                for i in range(8):
+                    v |= (bits[b * 8 + i] << i)
+                vals.append(v)
+
+            # Heuristics: many AC remotes: addr in first 2 bytes, cmd in 3rd
+            addr = vals[0] | (vals[1] << 8) if nbytes >= 2 else (vals[0] if nbytes >= 1 else 0)
+            cmd = vals[2] if nbytes >= 3 else (vals[1] if nbytes >= 2 else vals[0] if nbytes >= 1 else 0)
+
+        except RuntimeError as e:
+            cmd = e.args[0]
+            addr = 0
+
+        # Run callback (errors will be routed to error handler)
+        self.do_callback(cmd, addr, vals, self.REPEAT)

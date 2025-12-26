@@ -13,7 +13,7 @@ from ir_rx import IR_RX
 
 
 class IR_GET(IR_RX):
-    def __init__(self, pin, nedges=100, twait=100, display=True):
+    def __init__(self, pin, nedges=140, twait=100, display=True):
         self.display = display
         super().__init__(pin, nedges, twait, lambda *_ : None)
         self.data = None
